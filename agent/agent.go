@@ -49,7 +49,12 @@ type Agent struct {
 	keys                      []gossh.PublicKey                                     // SSH public keys
 	smartManager              *SmartManager                                         // Manages SMART data
 	systemdManager            *systemdManager                                       // Manages systemd services
+	// Collector proxy for remote or custom metric collection
+	collectorProxy           CollectorProxy                                         // If set, collect stats via remote/custom collector
 }
+
+// Stats is an alias to the internal system.Stats, exported for collector implementations.
+type Stats = system.Stats
 
 // NewAgent creates a new agent with the given data directory for persisting data.
 // If the data directory is not set, it will attempt to find the optimal directory.
@@ -172,10 +177,25 @@ func (a *Agent) gatherStats(options common.DataRequestOptions) *system.CombinedD
 		return data
 	}
 
-	*data = system.CombinedData{
-		Stats: a.getSystemStats(cacheTimeMs),
-		Info:  a.systemInfo,
+	var stats Stats
+	if a.collectorProxy != nil {
+		if s, err := a.collectorProxy.GetStats(cacheTimeMs); err == nil {
+			stats = s
+			// Update Info from collected stats
+			a.systemInfo.Cpu = stats.Cpu
+			a.systemInfo.LoadAvg = stats.LoadAvg
+			a.systemInfo.MemPct = stats.MemPct
+			a.systemInfo.DiskPct = stats.DiskPct
+			if len(stats.Bandwidth) >= 2 {
+				a.systemInfo.BandwidthBytes = stats.Bandwidth[0] + stats.Bandwidth[1]
+			}
+		} else {
+			slog.Warn("Collector stats error", "err", err)
+		}
+	} else {
+		stats = a.getSystemStats(cacheTimeMs)
 	}
+	*data = system.CombinedData{Stats: stats, Info: a.systemInfo}
 
 	// Include static system details only when requested
 	if options.IncludeDetails {
@@ -232,6 +252,19 @@ func (a *Agent) gatherStats(options common.DataRequestOptions) *system.CombinedD
 func (a *Agent) Start(serverOptions ServerOptions) error {
 	a.keys = serverOptions.Keys
 	return a.connectionManager.Start(serverOptions)
+}
+
+// CollectorProxy is an extension interface for custom or remote collectors.
+// Implementations should return Stats compatible with Beszel.
+type CollectorProxy interface {
+	GetStats(cacheTimeMs uint16) (Stats, error)
+}
+
+// SetCollectorProxy enables remote or custom metric collection via an external proxy.
+// This allows external binaries to inject custom collectors (e.g., OpenWrt, SNMP, or other remote systems)
+// while reusing the core Beszel agent connection lifecycle and protocol handling.
+func (a *Agent) SetCollectorProxy(proxy CollectorProxy) {
+	a.collectorProxy = proxy
 }
 
 func (a *Agent) getFingerprint() string {
